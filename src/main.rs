@@ -106,7 +106,7 @@ impl eframe::App for McServerStatusApp {
                 }
             }
 
-            if ui.button("Ping all servers").clicked() {
+            if ui.button("Ping all server").clicked() {
                 for server in self.servers.values() {
                     if let Err(e) = self
                         .tx
