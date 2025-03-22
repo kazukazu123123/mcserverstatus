@@ -1,9 +1,11 @@
+use std::collections::HashMap;
+
 use crate::server::Server;
 use eframe::egui::{self, Layout, TopBottomPanel};
 
 // Helper function to provide pagination information
 pub fn get_pagination_info(
-    servers: &Vec<Server>,
+    servers: &HashMap<usize, Server>,
     items_per_page: usize,
 ) -> (usize, usize) {
     (servers.len(), items_per_page)

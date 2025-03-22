@@ -1,33 +1,28 @@
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
-use std::sync::mpsc::Sender;
-use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio::sync::mpsc::Sender;
 
-static mut NEXT_ID: u32 = 1;
+use crate::event::ServerEvent;
 
 #[derive(Clone, PartialEq)]
 pub struct Server {
-    pub id: u32,
+    is_pinging: bool,
+    pub id: usize,
     pub name: String,
     pub ip: String,
     pub port: u16,
-    pub status: ServerStatus,
 }
 
-pub struct ServerStatusEvent {
-    pub server_id: u32,
-    pub status: ServerStatus,
-}
-
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum ServerStatus {
     Unknown,
     Online,
     Offline,
     Pinging,
-    Error,
+    Error(ServerPingError),
 }
 
 impl fmt::Display for ServerStatus {
@@ -37,7 +32,12 @@ impl fmt::Display for ServerStatus {
             ServerStatus::Online => write!(f, "Online"),
             ServerStatus::Offline => write!(f, "Offline"),
             ServerStatus::Pinging => write!(f, "Pinging"),
-            ServerStatus::Error => write!(f, "Error"),
+            ServerStatus::Error(e) => {
+                match e {
+                    ServerPingError::DnsResolveError => write!(f, "DNS Resolve Error"),
+                    ServerPingError::ConnectionError => write!(f, "Connection Error"),
+                }
+            }
         }
     }
 }
@@ -47,6 +47,12 @@ pub struct ServerInfo {
     pub motd: Option<String>,
     pub players: Option<Vec<Player>>,
     pub max_players: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ServerPingError {
+    DnsResolveError,
+    ConnectionError,
 }
 
 pub struct ServerPingInfo {
@@ -62,65 +68,46 @@ pub struct Player {
 }
 
 impl Server {
-    pub fn new(name: String, ip: String, port: u16) -> Self {
-        unsafe {
-            let id = NEXT_ID;
-            NEXT_ID += 1;
-            Self {
-                id,
-                name,
-                ip,
-                port,
-                status: ServerStatus::Unknown,
-            }
+    pub fn new(id: usize, name: String, ip: String, port: u16) -> Self {
+        Self {
+            is_pinging: false,
+            id,
+            name,
+            ip,
+            port,
         }
+    }
+
+    pub fn is_pinging(&self) -> bool {
+        self.is_pinging
     }
 
     // Address resolution
     fn resolve_address(&self) -> Result<SocketAddr, io::Error> {
+        // If an IP address is specified
         if let Ok(ip) = IpAddr::from_str(&self.ip) {
-            // IP address is specified
-            Ok(SocketAddr::new(ip, self.port))
-        } else {
-            // Domain name is specified
-            let address = format!("{}:{}", self.ip, self.port);
-            match address.to_socket_addrs() {
-                Ok(mut addresses) => addresses
-                    .next()
-                    .ok_or(io::Error::new(io::ErrorKind::NotFound, "No address found")),
-                Err(e) => Err(e),
-            }
+            return Ok(SocketAddr::new(ip, self.port));
         }
+
+        // Try to resolve the domain name
+        let addr = format!("{}:{}", self.ip, self.port);
+        let mut addrs_iter = addr.to_socket_addrs()?;
+
+        // Return the first resolved address
+        addrs_iter.next().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::AddrNotAvailable, format!("Could not resolve address: {}", self.ip))
+        })
     }
 
     // Ping the server
-    pub fn ping(&mut self) -> ServerPingInfo {
-        if self.status == ServerStatus::Pinging {
-            return ServerPingInfo {
-                id: self.id,
-                status: ServerStatus::Pinging,
-                info: None,
-            };
-        }
-        self.status = ServerStatus::Pinging;
-
-        let socket_addr = match self.resolve_address() {
-            Ok(address) => address,
-            Err(_) => {
-                self.status = ServerStatus::Error;
-                return ServerPingInfo {
-                    id: self.id,
-                    status: ServerStatus::Error,
-                    info: None,
-                };
-            }
-        };
+    async fn ping(&mut self) -> Result<ServerPingInfo, ServerPingError> {
+        let socket_addr = self.resolve_address().map_err(|_| ServerPingError::DnsResolveError)?;
 
         println!("Attempting to connect to: {:?}", socket_addr);
 
-        match TcpStream::connect_timeout(&socket_addr, Duration::from_secs(15)) {
-            Ok(_stream) => ServerPingInfo {
-                id: self.id,
+        match TcpStream::connect(&socket_addr).await {
+            Ok(_stream) => Ok(ServerPingInfo {
+                id: self.id as u32,
                 status: ServerStatus::Online,
                 info: Some(ServerInfo {
                     motd: Some("Minecraft Server".to_string()),
@@ -136,16 +123,50 @@ impl Server {
                     ]),
                     max_players: Some(20),
                 }),
-            },
+            }),
             Err(e) => {
-                self.status = ServerStatus::Offline;
                 println!("Failed to connect: {}", e);
-                ServerPingInfo {
-                    id: self.id,
-                    status: ServerStatus::Offline,
-                    info: None,
-                }
+                Err(ServerPingError::ConnectionError)
             }
         }
+    }
+
+    // Check the server status
+    pub async fn check_server_status(&mut self, tx: Sender<ServerEvent>) {
+        if self.is_pinging {
+            return;
+        }
+
+        let _ = tx
+            .send(ServerEvent::PingStatus {
+                id: self.id,
+                status: ServerStatus::Pinging,
+            })
+            .await;
+
+        self.is_pinging = true;
+
+        match self.ping().await {
+            Ok(ping_info) => {
+                let _ = tx
+                    .send(ServerEvent::PingStatus {
+                        id: self.id,
+                        status: ping_info.status,
+                    })
+                    .await;
+            }
+            Err(e) => {
+                println!("Error while pinging server: {:?}", e);
+
+                let _ = tx
+                    .send(ServerEvent::PingStatus {
+                        id: self.id,
+                        status: ServerStatus::Error(e),
+                    })
+                    .await;
+            }
+        }
+
+        self.is_pinging = false;
     }
 }

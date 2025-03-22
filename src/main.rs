@@ -1,20 +1,65 @@
 #[macro_use]
 extern crate rust_i18n;
 
+mod event;
+mod semaphore_manager;
 mod server;
 mod ui;
-use eframe::egui::{self, style::ScrollStyle, Context, Spinner};
+
+use eframe::egui::{self, Context, style::ScrollStyle};
+use event::ServerEvent;
+use semaphore_manager::SemaphoreManager;
 use server::Server;
-use server::ServerPingInfo;
+use std::collections::HashMap;
+use std::error::Error;
+use std::time::Duration;
 use tokio::runtime::Runtime;
-use std::{error::Error, sync::mpsc::{Receiver, Sender}, time::Duration};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 
 struct McServerStatusApp {
-    tx: Sender<Option<ServerPingInfo>>,
-    rx: Receiver<Option<ServerPingInfo>>,
-    servers: Vec<Server>,
+    rt: Runtime,
+    tx: Sender<ServerEvent>,
+    rx: Receiver<ServerEvent>,
+    servers: HashMap<usize, Server>,
+    servers_id_counter: usize,
     current_page_index: usize,
     items_per_page: usize,
+    server_list: ui::server_list::ServerList,
+    semaphore_manager: SemaphoreManager,
+}
+
+impl McServerStatusApp {
+    fn apply(&mut self, event: ServerEvent) {
+        match event {
+            ServerEvent::PingStatus { id, status } => {
+                if let Some(_) = self.servers.get_mut(&id) {
+                    self.server_list.update_status(id, status);
+                }
+            }
+            ServerEvent::RefreshRequest { id } => {
+                let Some(server) = self.servers.get_mut(&id) else {
+                    return;
+                };
+
+                // If the server is already pinging, don't send a new request
+                if server.is_pinging() {
+                    return;
+                }
+
+                let tx_clone = self.tx.clone();
+                let mut server_clone = server.clone();
+                let semaphore = self.semaphore_manager.semaphore();
+
+                self.rt.spawn(async move {
+                    let _permit = semaphore.acquire().await;
+                    server_clone.check_server_status(tx_clone).await;
+                });
+            }
+            ServerEvent::RemoveServer { id } => {
+                self.servers.remove(&id);
+            }
+        }
+    }
 }
 
 impl eframe::App for McServerStatusApp {
@@ -29,46 +74,63 @@ impl eframe::App for McServerStatusApp {
         );
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Ok(incr) = self.rx.try_recv() {
-                if let Some(result) = incr {
-                    self.servers.last_mut().unwrap().status = result.status;
-                }
+            while let Ok(event) = self.rx.try_recv() {
+                self.apply(event);
             }
 
             ui.heading("Minecraft Server Status");
 
             if ui.button("Add server (test)").clicked() {
-                let server = Server::new("test".to_string(), "localhost".to_string(), 25565);
+                let ip = "localhost".to_string();
+                let port = 25565;
 
-                self.servers.push(server);
+                let duplicate = self
+                    .servers
+                    .values()
+                    .any(|s| s.ip == ip && s.port == port);
 
-                todo!("Ping server");
+                if duplicate {
+                    println!("This server is already added!");
+                } else {
+                    let server_id = self.servers_id_counter;
+                    let server = Server::new(server_id, "test".to_string(), ip, port);
+                    self.servers.insert(server_id, server);
+                    self.servers_id_counter += 1;
+
+                    if let Err(e) = self
+                        .tx
+                        .try_send(ServerEvent::RefreshRequest { id: server_id })
+                    {
+                        println!("Failed to send refresh request: {:?}", e);
+                    }
+                }
             }
 
-            ui::server_list::show(
+            if ui.button("Ping all servers").clicked() {
+                for server in self.servers.values() {
+                    if let Err(e) = self
+                        .tx
+                        .try_send(ServerEvent::RefreshRequest { id: server.id })
+                    {
+                        println!("Failed to send refresh request: {:?}", e);
+                    }
+                }
+            }
+
+            self.server_list.show(
                 ui,
-                &mut self.servers,
+                &self.tx,
+                &self.servers,
                 &mut self.current_page_index,
                 self.items_per_page,
             );
         });
+
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let rt = Runtime::new().expect("Unable to create Runtime");
-    let _enter = rt.enter();
-
-    let (tx, rx) = std::sync::mpsc::channel();
-
-    std::thread::spawn(move || {
-        rt.block_on(async {
-            loop {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-            }
-        })
-    });
-
     let options = eframe::NativeOptions::default();
     eframe::run_native(
         "Minecraft Server Status",
@@ -79,12 +141,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                 style.interaction.selectable_labels = false;
             });
 
+            let rt = Runtime::new()?;
+            let (tx, rx) = mpsc::channel(16);
+            let semaphore_manager = SemaphoreManager::new(5);
+
             let app: Box<dyn eframe::App> = Box::new(McServerStatusApp {
+                rt,
                 tx,
                 rx,
-                servers: Vec::new(),
+                servers: Default::default(),
+                servers_id_counter: 0,
                 current_page_index: 1,
                 items_per_page: 10,
+                server_list: ui::server_list::ServerList::new(),
+                semaphore_manager,
             });
 
             Ok(app)

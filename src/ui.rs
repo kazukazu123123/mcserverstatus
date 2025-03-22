@@ -1,3 +1,3 @@
-pub mod server_list;
-pub mod server_item;
 pub mod pagination;
+pub mod server_item;
+pub mod server_list;
