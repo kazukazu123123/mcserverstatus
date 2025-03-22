@@ -32,12 +32,10 @@ impl fmt::Display for ServerStatus {
             ServerStatus::Online => write!(f, "Online"),
             ServerStatus::Offline => write!(f, "Offline"),
             ServerStatus::Pinging => write!(f, "Pinging"),
-            ServerStatus::Error(e) => {
-                match e {
-                    ServerPingError::DnsResolveError => write!(f, "DNS Resolve Error"),
-                    ServerPingError::ConnectionError => write!(f, "Connection Error"),
-                }
-            }
+            ServerStatus::Error(e) => match e {
+                ServerPingError::DnsResolveError => write!(f, "DNS Resolve Error"),
+                ServerPingError::ConnectionError => write!(f, "Connection Error"),
+            },
         }
     }
 }
@@ -95,13 +93,18 @@ impl Server {
 
         // Return the first resolved address
         addrs_iter.next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::AddrNotAvailable, format!("Could not resolve address: {}", self.ip))
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                format!("Could not resolve address: {}", self.ip),
+            )
         })
     }
 
     // Ping the server
     async fn ping(&mut self) -> Result<ServerPingInfo, ServerPingError> {
-        let socket_addr = self.resolve_address().map_err(|_| ServerPingError::DnsResolveError)?;
+        let socket_addr = self
+            .resolve_address()
+            .map_err(|_| ServerPingError::DnsResolveError)?;
 
         println!("Attempting to connect to: {:?}", socket_addr);
 
@@ -137,14 +140,14 @@ impl Server {
             return;
         }
 
+        self.is_pinging = true;
+
         let _ = tx
             .send(ServerEvent::PingStatus {
                 id: self.id,
                 status: ServerStatus::Pinging,
             })
             .await;
-
-        self.is_pinging = true;
 
         match self.ping().await {
             Ok(ping_info) => {
